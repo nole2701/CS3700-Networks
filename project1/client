@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+
+import socket
+import ssl
+
+# Helper method to process the FIND message and return the count.
+def find(msg):
+    splitted = msg.split()
+    count = str(splitted[3]).count(str(splitted[2]))
+    return count
+
+# Connecting to the socket
+hostname = "proj1.3700.network"
+
+
+# Pick Non-TLS or TLS socket here:
+#
+# Create normal socket (finds normal secret flag)
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((hostname, 27993))
+
+# Create Wrapped socket (finds TLS secret flag)
+# ctx = ssl.create_default_context()  
+# s = ctx.wrap_socket(socket.create_connection((hostname, 27994)), server_hostname=hostname)
+
+#Send HELLO
+s.send(str.encode('ex_string HELLO 001324501\n'))
+
+# Once connected, loop
+while True:
+    # Receives and decodes messages until a \n is found.
+    msg = s.recv(1).decode("utf-8")
+    while (msg[len(msg)-1] != "\n"):
+        data = s.recv(1)
+        msg += data.decode("utf-8")
+
+    splitted = msg.split()
+
+    # Does different things depending if it is a FIND or BYE message.
+    if splitted[1] == "FIND":
+        print("finding " + splitted[2])
+        print(find(msg))
+        s.send(str.encode("ex_string COUNT " + str(find(msg)) +"\n"))
+    if splitted[1] == "BYE":
+        print("Secret Flag: " + (msg.split())[2])
+        break
+
+# Shuts down the socket.
+s.shutdown(1)
+s.close()

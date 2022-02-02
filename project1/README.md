@@ -1,0 +1,2 @@
+After connecting to the server and sending HELLO, it receives messages until a "\n" is found, indicating a full FIND or BYE message.
+Without checking for the "\n", sometimes the messages would arrive incomplete and the program would run into an error with the index checking.

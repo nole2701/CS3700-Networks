@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+import ssl
+import time
+import gzip
+
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+
+##########################################################################
+
+HOST = "fakebook.3700.network"
+PORT = 443 # TLS port
+BUFFER = 1000000
+CRLF = "\r\n" # Carriage Return Line Feed aka cool name for newline
+
+# Internal HTTP Response Parse Fields
+BODY = "body"
+STATUS = "status"
+HEADERS = "headers"
+COOKIES = "cookies"
+
+# HTTP Status Codes
+SUCCESS = 200
+MOVED = 301
+REDIRECT = 302
+FORBIDDEN = 403
+NOT_FOUND = 404
+ERROR = 500
+
+##########################################################################
+
+socket.setdefaulttimeout(30)
+
+class FakebookHTMLParser(HTMLParser):
+	# Parse HTML While focusing on links to other pages 
+	# and secret flags if they're found
+	def __init__(self):
+		HTMLParser.__init__(self)
+		self.links = list()
+		self.secret_flags = list()
+
+	def handle_starttag(self, tag, attrs):
+		if tag == "a":
+			for key, value in attrs:
+				if key == "href":
+					self.links.append(value)
+
+	def handle_data(self, data):
+		if "FLAG: " in data:
+			secret_flag = data.split(": ")[1]
+			self.secret_flags.append(secret_flag)
+
+class FakebookCrawler:
+	
+	def __init__(self, username, password):
+		self.username = username
+		self.password = password
+		self.csrf_token = None
+		self.session_id = None
+		self.__login()
+
+		# Log in to Fakebook
+	def __login(self):
+		login_url = f"https://{HOST}/accounts/login/?next=/fakebook/"
+		get_login_page_response = self.__get(login_url)
+		
+		# Get CSRF token and Session ID after initial request
+		for cookie in get_login_page_response[COOKIES]:
+			if "sessionid" in cookie:
+				session_id = cookie.split("; ")[0].split("=")[1]
+				self.session_id = session_id
+			if "csrftoken" in cookie:
+				self.csrf_token = cookie.split("; ")[0].split("=")[1]
+		assert self.csrf_token is not None, "ERROR: Failed to get CSRF token from login page."
+
+		# Log in and get the same cookies again, using previous CSRF Token
+		login_content = f"username={self.username}&password={self.password}&csrfmiddlewaretoken={self.csrf_token}&next="
+		post_login_page_response = self.__post(login_url, login_content)
+		for cookie in post_login_page_response[COOKIES]:
+			if "sessionid" in cookie:
+				session_id = cookie.split("; ")[0].split("=")[1]
+				self.session_id = session_id
+				
+			if "csrftoken" in cookie:
+				cook = cookie.split("; ")[0].split("=")[1]	
+				self.csrf_token = cook
+		assert self.session_id is not None, "ERROR: Failed to get Session ID after login."	
+		assert self.csrf_token is not None, "ERROR: Failed to get CSRF token from login page."
+
+		#Get CSRF token and Session ID
+	def __get_cookies(self):
+		cookies = dict()
+		if self.csrf_token is not None:
+			cookies["csrftoken"] = self.csrf_token
+		if self.session_id is not None:
+			cookies["sessionid"] = self.session_id
+		return cookies
+
+		# Parse raw HTTP response
+	def __parse_http_response(self, data):
+
+		#Split the data into body and headers/status
+		data = data.split(b'\r\n\r\n')
+		response = dict()
+		body = data[1] if len(data) > 1 else None
+
+		#Since we specified gzip as encoding, we decompress the body first, and the decode
+		response[BODY] = gzip.decompress(body).decode()
+		status_and_headers = data[0].decode()
+		status_and_headers = status_and_headers.split(CRLF)
+		
+		initial_response_line = status_and_headers[0]
+		status = int(initial_response_line.split(" ")[1])
+		response[STATUS] = status
+		
+		response[HEADERS] = dict()
+		response[COOKIES] = list()
+		
+		headers = status_and_headers[1:]
+		#Set headers and add cookies if there's a Set-Cookie header
+		for header in headers:
+			(key, value) = header.split(": ")
+			if key == "Set-Cookie":
+				response[COOKIES].append(value)
+			else:
+				response[HEADERS][key] = value	
+		return response
+
+		#Send a request (in our case 1 POST and thousands of GETs)
+	def __send_request(self, request):
+		""" Send HTTP request and return parsed response. """
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		sock.connect((HOST, PORT))
+		
+		#Wrap the socket in TLS cause we're going HTTPS here
+		wrapped_sock = ssl.wrap_socket(sock)
+		wrapped_sock.send(request.encode())
+		response_data = wrapped_sock.recv(BUFFER)
+		wrapped_sock.close()
+
+		#return parsed response
+		return self.__parse_http_response(response_data)
+
+		# Construct and send a HTTP/1.1 GET request
+	def __get(self, url):
+		
+		assert HOST in url, f"ERROR: Crawler should only traverse URLs that point to pages on {HOST}"
+		url = urlparse(url)
+		
+		# Create HTTP initial request line and headers.
+		initial_request_line = f"GET {url.path} HTTP/1.1{CRLF}"
+
+		# Is always fakebook.3700.network but for general purpose we extract it from the url
+		host = f"Host: {url.netloc}{CRLF}"
+
+		#Accept gzip cause project description said it'd be faster
+		encoding = f"Accept-Encoding: gzip{CRLF}"
+
+		#Same reasoning here
+		connection = f"Connection: keep-alive{CRLF}"
+
+		# Construct the request
+		request = f"{initial_request_line}{host}{connection}{encoding}{CRLF}"
+
+		#Add cookies if there are any
+		#TODO remove duplicate code for request construction
+		cookies = self.__get_cookies()
+		if len(cookies) > 0:
+			cookies ='; '.join(f'{key}={value}' for key, value in cookies.items())
+			cookie_header = f"Cookie: {cookies}{CRLF}"
+			request = f"{initial_request_line}{host}{connection}{encoding}{cookie_header}{CRLF}"
+		
+		return self.__send_request(request)
+
+		#Construct and send a HTTP/1.1 POST request
+	def __post(self, url, content):
+		assert HOST in url, f"ERROR: Crawler should only traverse URLs that point to pages on {HOST}"
+		url = urlparse(url)
+		
+		# Create HTTP initial request line and headers.
+		initial_request_line = f"POST {url.path} HTTP/1.1{CRLF}"
+
+		# Is always fakebook.3700.network but for general purpose we extract it from the url
+		host = f"Host: {url.netloc}{CRLF}"
+
+		#Accept gzip cause project description said it'd be faster
+		encoding = f"Accept-Encoding: gzip{CRLF}"
+
+		#Same reasoning here
+		connection = f"Connection: keep-alive{CRLF}"
+
+		#Got it straight from the browser so why not
+		content_type = f"Content-Type: application/x-www-form-urlencoded{CRLF}"
+
+		#Need to specify for POST requests
+		content_length = f"Content-Length: {len(content)}{CRLF}"
+		
+		# Construct the request
+		request = f"{initial_request_line}{host}{connection}{content_type}{connection}{encoding}{content_length}{CRLF}{content}"
+
+		#Add cookies if there are any
+		#TODO remove duplicate code for request construction
+		cookies = self.__get_cookies()
+		if len(cookies) > 0:
+			cookies ='; '.join(f'{key}={value}' for key, value in cookies.items())
+			cookie_header = f"Cookie: {cookies}{CRLF}"
+			request = f"{initial_request_line}{host}{connection}{encoding}{content_type}{content_length}{cookie_header}{CRLF}{content}"
+		
+		return self.__send_request(request)
+
+		# Crawl the Fakebook and return 5 secret flags
+	def crawl(self):
+		secret_flags = list()
+		root_page_url = f"https://{HOST}/fakebook/"
+		
+		#deque is almost the same as queue but we haven't implemented threading here,
+		#so we don't use queue
+		#TODO but what if...
+		unvisited_pages = deque()
+
+		#The root page is the first one we visit
+		unvisited_pages.append(root_page_url)
+
+		#set cause we don't care about the order and are faster to check
+		visisted_pages = set()
+		count = 0
+		start_time = time.time()
+		print("Time elapsed: ", start_time)
+
+		#The program terminates when either all the website pages are visited
+		#or all 5 secret flags are found
+		while len(unvisited_pages) > 0:
+			count += 1
+			print("Count: ", count)
+			current_time = time.time() - start_time
+			print("Time elapsed: ", format(current_time, '.3f'), 'seconds')
+
+			#Since we're doing BFS here, we use popleft			
+			next_page_url = unvisited_pages.popleft()
+			print("next page url: ", next_page_url, '\n')
+			try:
+				get_page_response = self.__get(next_page_url)
+
+				# Mark page as visited
+				visisted_pages.add(next_page_url)				
+				status = get_page_response[STATUS]
+
+				#Check the page for cookies, because they may update (for some reason)
+				for cookie in get_page_response[COOKIES]:
+					if "sessionid" in cookie:
+						session_id = cookie.split("; ")[0].split("=")[1]
+						self.session_id = session_id
+						
+					if "csrftoken" in cookie:
+						cook = cookie.split("; ")[0].split("=")[1]	
+						self.csrf_token = cook
+
+				if status == SUCCESS:
+					# Parse HTML
+					html = get_page_response[BODY]
+					html_parser = FakebookHTMLParser()
+					
+					#Consoom HTML to give us links and possible flags
+					html_parser.feed(html)
+
+					# Only crawl the target domain
+					links = html_parser.links
+
+					# Unfortunately putting the host in the filter breaks the very first link given to us,
+					# So we just check for /fakebook/ and add the host later on, which does the job just fine
+					# TODO fix the issue 
+					filtered_links = list(filter(lambda link: "/fakebook/" in link, links))					
+					for link in filtered_links:
+						link_url = f"https://{HOST}{link}"
+						if link_url not in visisted_pages and link_url not in unvisited_pages:
+							#Add the links from the page to the list of unvisited pages (to visit later)
+							unvisited_pages.append(link_url)
+
+					# Get any flags for page
+					# TODO maybe do something better than extend
+					secret_flags.extend(html_parser.secret_flags)
+
+					# Terminate if 5 flags are found
+					if len(secret_flags) == 5:
+						return secret_flags
+				elif status == MOVED or status == REDIRECT:
+					# Crawler tries the request again using the new URL given by the server in the Location header.
+					move_or_redirect_url = get_page_response[HEADERS]["Location"]
+
+					# Note that we use appendleft here to essentially push onto the queue, so that it's the first one 
+					# when we do popleft in the beginning of the loop
+					unvisited_pages.appendleft(move_or_redirect_url)
+				elif status == FORBIDDEN or status == NOT_FOUND:
+					# Abandon the URL...
+					pass
+				elif status == ERROR:
+					# Put the page to the end of the queue, so that we try to access it later.
+					unvisited_pages.append(next_page_url)
+				else:
+					raise Exception(f"ERROR: Unrecognized Status: {status}")
+			except socket.timeout:
+				raise Exception(f"ERROR: Socket timeout.")
+
+		return secret_flags
+
+def main():
+	# Get login information.
+	args = sys.argv
+	username = args[1]
+	password = args[2]
+	
+	crawler = FakebookCrawler(username, password)
+	secret_flags = crawler.crawl()
+	
+	# Crucial part of the code
+	print("######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"######################################################################################################################################################\n"
+"#################################################################@M#+#n@@#############################################################################\n"
+"##############################################################@Wx#*;:,*##nnnMWW@######################################################################\n"
+"###########################################################@WMxnnnnnnzzzz######znM@@##################################################################\n"
+"########################################################@Wxxxxxxnnnnnnnnnnnnnzz##zzxxW@###############################################################\n"
+"#####################################################WMxxnxxxxnxnnnnnnnnnnnnnnnnzzzzzxxW##############################################################\n"
+"###################################################MMxxxxxxxxxxxxxxnnnnnnnnnnnnnnnnnzznxM@############################################################\n"
+"#################################################@MMxxxxxxxxxxxx#i,;xnnnnnnnnnnnnnnnnnnnxM############################################################\n"
+"###############################################@WMMxxxxxxxxxxxn.` .;xxnnnnnnnnnnnnnnnnnnnxM###########################################################\n"
+"###############################################WMMxxxxxxxxxxxxx#i`+xxxnnnnnnnnnnnnnnnnnnnnxW##########################################################\n"
+"##############################################@WMMMxxxxxxxxxxxxM+ +xxznnnnnnnnnnnnnnnnnnnnxM##########################################################\n"
+"##############################################WMxxxxxxxxxxxxxxxM#`*xn`;xnnnnnnnnnznnnnzznnnx@#########################################################\n"
+"#############################################@MMxxxxxxxxxxxxxxxM# ix#`.nnnnnnnnnnnnnnnzznnnxM#########################################################\n"
+"#############################################WMMxxxMxxxxxxxxxxxMz`ix:``*nnnnnnnnnnnnzzzzzznnx@########################################################\n"
+"#############################################@MxxxxxxxxxMxxxxMxxz`ix```,nnxnnnnnnzzzzzzzzzznx@########################################################\n"
+"#############################################MMMxxxMMMMxMxMxxxxMz`i# ::`z:.nnnnnzzzzzzznzzzzxW########################################################\n"
+"############################################@WMxxxMMMMMMMMxxMxxM#`*;`++ *. nnnnznnzzzzzzzzzznM########################################################\n"
+"############################################WWMxxMMMMMxzxMMMMxxM#`;``ii`.` znnnnnzzzzzzzzzzzzx@#######################################################\n"
+"############################################@MMMMMMMMMMnMMWMMxn,`  ```` ```nnnnnnzzzzzzzzzzzznW#######################################################\n"
+"############################################WMMMMxMMMMxnxWWWMMx:;i.`i#+i`.+nnnnnnnzzzzzzzzzzznM#######################################################\n"
+"############################################MMMMMMMMMMM#nMWWMxxxxx.`nxnn..nnnnnnnnnzzzzzzznzzzx#######################################################\n"
+"###########################################@MMMMMMMMMx*z#.;MMMxxz*`.;+z;. :ixnnnnnzzzzzzzzzzzzx@######################################################\n"
+"###########################################WWMMMMMMMM,`..``*WMMx.````*z````.xnnnnnzzzzzzzzzzzznW######################################################\n"
+"###########################################@WMMMMMMMx```.`.iWWMM#zznnnxzzzzzxnnnnnzzzzzzzzzzznnM######################################################\n"
+"###########################################@MMMMMMMMM::`,.+nWWMxxxxxxxnnnnnxnnnnzzzzzzzzzzzzznnx@#####################################################\n"
+"###########################################WMMMMMMMMMn#..`*xWMMxxxxxxxxnnnnnnnnnnnzzzzzzzzzzznnnW#####################################################\n"
+"###########################################WMMMMxMMMMxz:.,+xWMxxxxxxxxnnnnnnnnnnnnnzzzzzzzzzznn#n#####################################################\n"
+"###########################################WMxMMxMMMMMn####nxMxxxxxxxxxnnnnnnnnznzzzzzzzzzzzznn**@####################################################\n"
+"###########################################WxxMxxMMMMxnzznzznMxxxnnxnnnnnnnnnnnnnnnnnzzzzzzzznz+;@####################################################\n"
+"###########################################MxxMxxMMMMxznMMMxxxxxxxxMMMWMWWWMMMMMMMxxxxnnnzzzznzzix####################################################\n"
+"###########################################MMMMxxMMMMxxMWWWWMMWW@@@@@@@MMMWWWWWWWWW@@@@@WWMMxxnnznM@@#################################################\n"
+"##########################################@MMMMxxxMMMMxW@@@@MW@@@@@#@##@######@#####@@@@@@@@@WWWMMMxM@################################################\n"
+"##########################################WMMMMMMWWW@WMW@@@@MW@#########################@@@@@@@@@@WWMM@###############################################\n"
+"#########################################@MMMWW@@@@@@@MW@@##MW##############################@@@@@@@@WW@###############################################\n"
+"########################################@MWW@@@@@@###@WM@###MM#@@@@@@@@@@@@@@@@@@@###########@@@@@@@@W@###############################################\n"
+"#######################################WWW@@@@@@######@M@@@@i:M@@@WWWWWWWWWWWWW@@@@@@@@@@##@@@@#@@@@WW################################################\n"
+"#######################################W@@@@@@@######@M,i@@@i.nWWWMMMxxMMMMMMWWWW@@@@@@@@@@@@@W@##W@##################################################\n"
+"######################################@W@@@##@####@@@@W.+@@WWi;MMMxxxxnxxnxxxxMMMMWWMMWMWWMMMxnM@@####################################################\n"
+"######################################@W@@#@#@##@@@@@@M,x@WWMWMxxxxnnnnznnnnnnnnnnnnnnnzzzzzz##nW#####################################################\n"
+"########################################@@@##@@@@@@@@@WM@MMMxMMxnnnnzzzzzzzzznzzz###*++++++++*+zW#####################################################\n"
+"##########################################@##@MWWWMMMMMMMxxxxxxxxnnzz#zz##zznzzzzz#++##+*+++++#z@#####################################################\n"
+"###########################################@@@xMxxxxxxnnxnxxMMMxxnnz#######zzzzznnnzzzz##+++*+#z@#####################################################\n"
+"#############################################MxxxxxxxnxMMMWWWMMxnzzz#+##++#zznnnnnnzz#**###+*++z@#####################################################\n"
+"#############################################WMxxxxnnxMWWWWWWMMMxxnz+++++*#znnnnnnnz#+****++*+#zW#####################################################\n"
+"#############################################WMxxxxnxMMMMWWWWMMMMxnz###+++#zzzznnnnnz#++***++**zz#xW##################################################\n"
+"#############################################@xxxxxxMxxxxMMMMMMMMxxnnn#####zznxxxMxnzz##++***;,:#*++zW#@##############################################\n"
+"##############################################MMxxxMxxxxxMMMMMWWMMMxnnzzz##znxMMMMnzzzz###++i:,,:#ni,:z@##############################################\n"
+"##############################################MMxxxxxxxxMMMWWWWWWWMMxxnzz#zzxxxxxnn#*+#nz##++*:,,zMi:,,+@#############################################\n"
+"############################################@MnnxxxxxxMMMMMMMMWWWWWMMxnz###znxxMMMMMz###zz#+++**+zz#;,,+n@############################################\n"
+"##########################################@xnnz+#nnxxMMMMxxnnnxMWWWMxxn#+*+#znMWM@@@MMWMn##++##z#++z+**zzzM###########################################\n"
+"#########################################x*i+x*i*nxxMMMMxnxxxnnxMMMMxnn#+*i*#xMMxMxn#*+##+++*+xnzn#zzz####nM@#########################################\n"
+"########################################M*;;*niiinxxMMMMMW@@@@xWWWMxxxnz++***#nxxxnz##++++++*izMxxnzzznnz#znn@########################################\n"
+"#######################################W#i;:+zii+nxxMMW@WWMMMnznxMMxxxnz#+++++znxxxnz#+++++****xMMxn###xxzz+znW#######################W*;,;@##########\n"
+"######################################@xzii*nznnnxxxMxxxxxxxxxxxMMMMxxnz+***+++##zzz##zz#+*ii*+#MMxn#+++nxz#+#zx@####################W+:,..M##########\n"
+"######################################xnnnnxnnzzxxnxxxxxxxMMMMxxxxxxnnnz+****+***++#####++*ii*+#xxMnz####nxn#z##zx@##################n*:...M##########\n"
+"#####################################WxnnznxnxnxMxnnnnnxxxxxxnnnxxxnnnn##+***++*i*+#####+**;i*+zM#nxzzzz##nxnnzznnnW################M+i:..:W##########\n"
+"####################################MxnnnnMxnxMMMxnnnnnzzzzzznnnnxxnxxn#++**+++*ii*+##z#+*i:;i+#x+#MxnznzzxnxMnnnnnznW#############@#*;;,,+###########\n"
+"###################################@nnznnMxznnxWWxnnnnzz##zzznnnnnxxxnz#+****+++**++++##+*i,,i+#n+#MMxnxnzzzzxWxzznzzznx@##########M+ii:;;x###########\n"
+"##################################@xnzzznMz##zMWMxnnnzz####zznnnnnxxnn#++**i*+##+*+###++**i,:*+#z+n#WMxnxnzzzznMxnzzzzzznnW#######@z*i;:iz@###########\n"
+"##################################xnzz#zMn#++#MMMxxnnzz#++##znnnxxxxnz++**i:;*+++*znnz#+**i;i*###*@##MMxnxnz#nznnMnnnnzzzz#nW#####W#***iiz############\n"
+"#################################Mnnnz+nxz#++nMxxMxnz###++##nnxxxxnn#+**ii;,;;;;;i+zxxn##+*i*+#######@MMxxnzzzzzznxMxnz#zz###z@###Mz**i#+z############\n"
+"################################Mxxnz#zMnz#*#xMxMMxnz###++#zxxxxzzzznz#+++**++*++*+#zMMnz+**+##z+x####@MMxnnzzz#nnzznxxnzn#++++M##x#***#+z############\n"
+"###############################Mnxnzzzxxnz#+zMxxxxxnn#+##zzxxxxxzzznxxnz##++zxMMx+**+#xMxz+*###z*x#####@Mxxxnnzznnzzzznnzzz++*+z@#x#*++#*#############\n"
+"##############################Mnnnnznxxnxz##xWWWnxxxnz##znxMMxnxxxMWWMnnnz+#zzz#*iii*++zxMz+##zxz@#######MxMxxnzznznnzzzzz##+**+#Wn#*+++i+W###########\n"
+"#########M++x@###############Mnnzz##xxnnnznzMW@@zxxxnnnnnxMMxnnnnxxMMMMMMMn#*i;ii*iii****zMz##nMM#########@xxxxnzzzxxz######+*i*+#z#++++i*M###########\n"
+"########@i;ii*M#############Mnzz##+nWxnz#zznWW##xnxxxxxxxMWxnnnznnzznnxxnzz#+*ii*****ii*i*Mx##xMM##########@xMxnnnnnnz#++++++***++##+##+i*M###########\n"
+"########@iiiii*W###########Mzz##++zMxzn#+##MM#@#@MxxxxxxMWMnnzzznnnnxMMxnzxxxzznnnnzz##***nMz#xMW##########@@xMxnnxxnz+++*+++**+*+#++zz+iiM###########\n"
+"########@+i*i;iz@########@nz#z#+*#MMzzz++#nM@####@MMxxxMWMxnzznxxMMMMMMnzzxxxnz#+*i**ii+##zx#zxM@###########@xMMxxxxnz#++*+*****++#**+#+ii############\n"
+"#########M**#*;*z@#####@Wnzz###*+MMzz#**+#nM######MWMxxW@xnnnxxMxxxxnnz##+#+++*iii+###zxn#zzznMM@#######@WxxxxMxMMxnz###+******i++#++**+*i#@##########\n"
+"#########@z#z+i*#W####@Mnnz##+*+Mxzz#**##zx@######@WWxxWWxxxxnnzzznnnnzzz##zzz###nxMWMxx##z#znMM#######@MWWWMMMMMMxz##++**++++*;**#+*i*i*i*W##########\n"
+"##########Wxz#+*zx####xnz##++*+xxzz#*i##zn@#######@WWMxMMxMMxxxxxxxMMxxxnnnznz#*+#zMWzz#+#z#zxxW#######MWWMxxxxxxxz#++++*++**##;*+++*iiiiiiW##########\n"
+"##########@xnz#+nx@##Wnzz#++*#xnz##+i+#z#M#########MWMxxMxMWWW@@WWxMxnnnnz#*;,,,,;:nMz#*+#z#nxM#######@WMxnnnnxxxn#+++#++#+*++#i*+*+*ii;;iiM##########\n"
+"##########@xnnz#nx@#Mnzzz+**+nzz##+i*++#z@#########WWWxxnxxxxxMWnz#+#+*;.:,`.`....;xx#**+zzznxW########Wxxnzznxxxn#++++#+#z+++#***i++*i::;iz##########\n"
+"##########@xnnz#zxW@xzzz#+++znzz#+*i*+++M##WW@######MWWxnxxnxxxWx*;;:,,.`.`````...+xz+i*+zzzxx#########MMxxxxxxMxn#+++++++#z++#*****#+*::;i###########\n"
+"##########@xnzz#zxnnzzz##++znzzz+****++#xMxxMMW#####@MWMxxxnnnxxMzii;,..`..``.;i,:#z+ii*#zznnM#########@xMMMW@WMxz#+++###++z++#*i++**+*;:;;i@#########\n"
+"##########@nnzz#znnzzzz#+#znzzz+*+**+##zznzzznxM#####MMMxxxnnznnxn+;#++#++z++;,``:n*iii*zzzxx###########@xMMMWMxz##+++#zz#+##++iii+*iii*;:iiW#########\n"
+"##########@nzzzzznzzzzz###nzzz#*i**+*+zzz##+++zx######MWMxxxnnnnzn#:,,,,,,,..`,`,++*iii+#znnM############MMWMMMn##+++++#z#+###+*ii**iiiii;;iW#########\n"
+"##########Wzzzzzzzzzz###zznzz##*+++zzzz##+iiii#x######@MMxxxnnnnz#z+,::,:,:.:,:.++i*ii*+#znz*xMMM#######WWMMMMxn#+####++#z#+##++*ii**iiiii;;n#########\n"
+"##########Mzzzzzzzznz#zz##z###++++#zz#++*i;ii+zx#######WxMxxxnnzn#++ii+*+*+i*i*i*;;*i**+znzzi.``.iz#####MMMxxxxnz#####z++zz#++*++*iiiiiiiii;##########\n"
+"##########xzzzzzzznzzzz###z###+++####++iiii*+#zM#######@#nxxxxnnzzz++**+*******i;i**i*++znnzz:````.z####MMxxxxnxnzzz###z++z#****++i;iiiiiiiii@########\n"
+"##########xz#zzznnzznz#zzz####++####++*i**+#zzn@#####@*;,,zxxxnnnnznz#+++**+****++*i**+#znnzn;`..``,#nn@Mxxxxnnnnzz###+z#+z#*i**++*iiiiii**iiM########\n"
+"#########@zzzz#znzznn##zz###z#++##+***i*+zxnzzM######*.,..#xxxnnnnnnnnnz#######++*****+#nnnzn+....`````;++#znnnnnznzz#+#z##+**i**++*;;;iiii*in########\n"
+"#########@zzzzzzzzzzzznn#+#zz+++##+i**+#xMn##zW#xWWz:`...,#Mxxnnnnnnnnnnnzzzzz###+****+zxxnzn*,..```  ```.:i#zzxnnnnnz#+#z#****i**++i;;;;iii**@#######\n"
+"#########@zzzzznzzznnzzz###zz+#+##+**++nWxnzzx@z..,......;+WMxxnnnnnxMMMMMMMxxnz#+****#nxxnzn#,.````  ```` `.:*zxxxxnnz#+z#********+*i;;;;;i*in#######\n"
+"#########@zzzzzzzzzzzz####zz+*##+++++#zzxMnz#;:.`..,..,.,i#MWxnnnnxnxxxxxxMxnn##+++**+zMxxnzn;,``.``    ` ` `.`,+nnnnnz####***********;;;;;;ii*@######\n"
+"#########Wzzzz##z####z#zznz+*#z++++++#zzzzzz+;,..`...,,.:i#MWWxnnnnxxnnnnnnz##+++++**#MMxxnnx#,...`        ``.` `.;#nnnnz##++***++**i*i;;;:;;iin######\n"
+"#########Mzzz##zz##zzzzzzzz+#z#++++++++#z####zi.`..,,,..;i#MWWWxxnnnnnnzzzz##++*+***+xMMxxnnx;,`.``   ``` `.``  ` `.*nnnnz###++*+****ii;;;;::;i*######\n"
+"#########xzzzzzz###zz###zzz#####z#+#++*+######+.....,,..;*#xWWWWxnnnznnzz###+++**+++nWMMxxnnMi,``.   ` ``..````` ` `.+nnxnz###++++***i;;::;:;;iiM#####\n"
+"#########xzzzzzz########zn#++++++++###i+#+++##+......,,,i*nxMWW@Wxnnnnzzzz######++#nWWMMMxxxx:,```   ```.`` `  `  `..:+nxnnzz####++**ii;;:::::iin#####\n"
+"#########xzzzzzz##########++++++**+#z++#++++##;....`..,.;i#MMWWW@@Mnnnnnnzzzz#####nWWWMMMxxxM::```   ``.`      ``.:.``,+znnnnzzzz##+**i;::::::;i+#####\n"
+"#########xzzzzz############++++**#zz##z##+###i........,.iizxMMWW@@@WxxxxxnnnnnnzznWWWWMMxxxMi:,``   ```` `   ```,:`    `;*znnnnnnzzz+*i;::;::;;i*M####\n"
+"#########xzzzz#######+##z+######zzz#zzz#+#n#;``.........:**nMMWW@@@@WMxxxxxxxnnnMWWWWWMMMxxMi;,``  ````     ``.:,`      ``:+nnnnzzznz#i;::;i+i;;iiz@##\n"
+"########@zzzzz######++#zzzzzznnz#+++##z###*,..``........;ii*MMWWWW@@@@WMMxxxxxMWWWWWWMMMxxz+:,.`` ````    ``.,,.     ` `````;znnzzzznz+;::;#+:..,,`i@#\n"
+"########@zzzzzz####++##+#zzzzz##+*+#z#z+i,,,..........,.:i*:+MWWWW@@@@@WWWWWWWWWWWWWWMMMx#:+,;.`````     ```..`    `````````.iznzzzznnz+:,i*,...:i:,M#\n"
+"########@zzzz######+##++++##+#***+zzz+*:....,,,........,:+ii,*xWWWW@@@@W@WWWWWWWWMWWMMMni.;i;,``````  ```````     ````````````innzzzznnzi:i.``.,,.i:##\n"
+"########@zzzz#######+++++++##+*+++##+:.......,,......,..:**i,,;+xWWWWWWWWWWWWWWWWMMWMni,.,i,+:````  ```.,``      ``````````````;nzzzzznn#i,```.```,;i@\n"
+"########Mzzz#######+++++++++++++#z#+;.........,,,.....,.,+;i:,:::;+znMWWWWWWWMMMxz+i:,,..:;::,````````.,.`      ````````````````#nzzzznni.`````.```;;n\n"
+"########xzzz######+++++++++##+#zzz+;,,.........,,,,......**i,..,,,,,,,:::;;;::,,,,,,,,...i,+i.``.````...`      ```` `````````.` inzzzznn;,```.``...:,z\n"
+"########zzz####z##++++**++###zzz#+;::,,..........,,,,...,+*::...,,,,,,,,,,,,,,,,,,,,,...:*:;:`..```...``  `   ```````````````.` iznz##i:ii````.::....#\n"
+"#######Wnzz###z##++***+**++#zzz#+:.,,,,,...`......,,,,..,;*i:............,,,,.....,,...,i,+:...```...``      ```````````````..`:z++i:;:,::`:..`.,.`,.+\n"
+"#######Mnzzzzz###++***++*+#zzz#*:....,,,....`.......,,,.,i+;;,........................,:i:;:.```...``` `    ```    `````````,.`;*;;i:*,:#.`;,.```.`.`.\n"
+"#######xnnzzz####++****+++#zz#*,......,,,............,,,,;*;;:.,,,,,,.........,,,,,,,,:;,*i...,,..``` `    ```    `````````.,.`,*:*:,+,.#:`,;.```...`:\n"
+"#######xxnnz#zz##++****+++###i,........,,,............,,,;+i:;:,....,,,,,,,,,,,,,,,,::;*;;;.,,,,.````     ```     `````` ``.,``.i;;i,i;,*;:`i,.``..,`z\n"
+"#######xxnnznnz#+++***++++#+;,.........................,,;i*;;:,,,........,,,,,,,,,,,,;:*i,.,,,.```      ````     `````````,.` `i*;i;:;:,,*..;,,..,,iW\n"
+"#######xxxnxxn##+++***+++++;,...........................,:+#,,,,..,,........,,,,,,,,,;#;;i,,:,.````     ```      `````` ``.,.` `;ii;*;;*;;;.``:,:,,i+z\n"
+"######@xxnnMxn#++++++**+++;,,,....`......................:;i+;;.............,,,,,,,,:i:+i:,,:..````    ```      ``````````..``   `#nxxxMMMz##+*z+i*++#\n"
+"######WxxnxMxn#++##++****;.,,............................,;+;;;.............,,,,,,,,,*;ii:,,,.``` `   `.``      ``````````..`  ```+nnnxxxMMxnnn#+*+##+\n"
+"######MxxnMxxn++#z##+***;..,..............................::*;:,............,,,,,,,,;;**;:,,.`````` `````      ```````````.``  ` `*xxxMxzzznz*ii+##+#+\n"
+"#####MzxxxMxxn##zz###***,`.....................`..........,;+;:,..............,,,,,,iii+;:,.```````````       ````````````.``  ```innnnnzzz#z+***+*+##\n"
+"####xi*xnxxMxnzzzzzz#+*i.``............```.....``...```...,,;i,,.............,,,,,,;;*ii;,..```````````      ``````` ````..`   ```;nxxxxnnz##+*ii*+###\n"
+"#####;znnxxxxnnnnz###+*;````..```.....``````....```.````...:+*i:..`.........,,,,,,,i:*#i:,..``````.``````    ``````` ````.``  ````,nnxnnnzz###*ii++#++\n"
+"###W+i*xnnnxnnznzz##+**;.`````````....```````....````````.`,:*,,..``.........,,,,,:+ii*;,..`````..````````` ```````  ```````   ```.znxxnz#zz##*ii**+#+\n"
+"###W+;;#xnnnnnzznz#++**:.`.```````.....```````....`````````,,;*:,`.`..........,,,,::*#i,...```...```````````````     ``````  ``````#nxxn#znzzz+i*++++*\n"
+"###Wzz*:#xxnnnnxxxz#+++:....``````.....`````````...````````.:*;,:.```.........,,.,+i;*i,..``....````````````````      `````  ``````*nnnzznz###*i***i**\n"
+"###W*++i:innznznnn##+***,...```````....``````````...```````.,,i:..```............,i*+i:.........````````````````      ````   ``````ixxxnnnz###+*iiiii*\n"
+"###Wzz+*:,;#z##z##++***z#i..```````.....```````````..```````,;i;:.`..............;;i+i,...,.....```````````````       ````   ``````inxxnzz#####+*i;;i*\n"
+"###@x##xz*i.:;+##+++*++n#i..```````.....`````````````.``````.,:;,..``...........,i*ii;...,.....`.....`````````       `````  ```````innnnzzz#####**ii;*\n"
+"###Mxxxiiz+i*:,,i*;++#z*;:...````````...``````````````.`````.,i*i:`````.........:,*#i,..,..............`````````     ````   ```````:nnnnnzzzzz#+**iii*\n"
+"##@xMxxnn*i*#;:#,.ii,ii::,...````````...````````````````.```.,;i,,.```.........,+;*i;...................````````     ````   ```````.zxxxnz#zzz#++*****\n"
+"##WMxxxxx*+n#i#ziiz;i#;i,.....`````.....`````````````````.```,.:*,.````........,,*n;,,,.................``````````   ```    ````````#xnxnzznnnz###*iii\n"
+"##MMxxxxnnx#i+#+;##;+*,,,,....````......`````````````````..``.;*i:,``..`......,+:i+i,,,..................``````````  ```    ````````+nxxxnnzzz#+++*iii\n"
+"##MxxxxxnnnxMM#*#*:ii:;,.,,....```.........````````````````.`.,,*:..``........:;i+i:.,....................`````````  ``` ` `.```````+nxxnnzzzzz#+**i**\n"
+"##Mxnxxxnxnxxnnnxn+z#*;...,......`...........,...```````````..,::+:.````.....,i,*#i,,,......,......,,,,.....```````````  ` ..```````*nxxxxzzzz#++**i**\n"
+"#@xxxxxxxMxznnnnz###++:................``````..,,,..`````````.,,;i,.`````....:i;ii,.,.....,....,,,,,,,.....```````````` `` ..```````innnnn###zz+*+*ii*\n"
+"#@xxxxxxnxzzznznnz#+#+,`..,,..,........``````````..,,.````````.,,;*,.````..,,;,*+:,.....,..,,,,,,...........``````````` `` ,.```.:*##nzznz##zzz#+++*i*\n"
+"#Mxxxxxxxnzzznnnxnz#++.`...,..,........`````````````.....``` ``.;i;,.````...,i:ii,.......,,,,,...............`````````` ` `:``.i#nxn#nnzzz##zzz##++*ii\n"
+"#Wxxxxnxxnnzznzzzz##+*``...,,.,,.......`````````````````....```..:*,``````..,,**,......,,,....................``````````  `;`;#nnnxz#nnnnnz#zzz##+++*i\n"
+"#Mxxnxxxnnnznzzzz####+```...,.,,,,......````````````````````..`.,;i*,````...*:ii....,,,........................```````````,:*zzznnzz#nxxxxn#++###++++*\n"
+"@xxnnxxxnnnnnzzxz#++++```...:.,,,,.......``````````````````````.,:;,.......,:;i,,,......,.......................```````` `;#zzzzzznxznnnnnn#+#znz#++**\n"
+"Wxnnxxxxnxnnnnnxz#+++*.``.,,:,,,,,,,.....``````````````````````.,,:*i:,.,,i;:i:,........,.........................````````znzzzzzxnnznxxxxxn###z#+++**\n"
+"Wxxxxnnxnxznnnnxn#+++++*;:,,:,,,,,,,,,...```````````````````````.,**;:,::;:*::,.........,.,,......................```````,xnzznznxnnzzxnnnnz+*+#####+*\n"
+"Mnxxnnnnxxnnnnnnnz#+++#+#zz*;;,,,,,,,,....```````````````````````,::i#::i:;i*,.....................................``````iMnznnnxxnnnznxxnnn#+#zz###++\n"
+"Mnnxnnznnnxnzznnzz#+++n###xMx+:,,,,,,,,....``````````````````````.::in;;*i:*:.......................................````.#Mnnnnznnxxnznnnnnn#++znnz+++\n"
+"xnnnnxnnznxxzzzzzz#+++z#+#nMMx::,,:::,,....``````````````````````.,,;+i;+i:,.`......................................````:nWxzzzznxxxnznzznnz#**+zz#++#\n"
+"xnnnnnnzznxxznzznz####z#++nMMW;:,::::,,....```````````````````````.,,;;:*:..`.`................,,...................```.ixMnzzzxxMMxxznnnnnzz+**#z#++#\n\n\n")
+	for secret_flag in secret_flags:
+		print(secret_flag)
+
+if __name__ == "__main__":
+	main()

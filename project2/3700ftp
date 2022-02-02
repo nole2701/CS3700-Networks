@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+
+import socket
+import ssl
+from urllib.parse import urlparse
+import sys
+import os
+
+
+operation = sys.argv[1]
+param1 = sys.argv[2]
+param2 = ""
+if len(sys.argv) > 3:
+    param2 = sys.argv[3]
+print("Operation=" + operation + " param1=" + param1 + " param2=" + param2 + '\r\n')
+
+# Receives and decodes messages until a \r\n is found.
+def recv_response(socket):
+    msg = socket.recv(1).decode("utf-8")
+    while (msg[len(msg)-2:len(msg)] != "\r\n"):
+        data = socket.recv(1)
+        msg += data.decode("utf-8")
+    return msg
+
+# Function to get credentials from a specified URL in the command line
+def get_credentials(param):
+    param1 = param.split('ftps://')[1]
+    username = param1.split(':')[0]
+    param2 = param.split("ftps://" + username + ":")[1]
+    password = param2.split("@")[0]
+    return username, password
+
+# Get username and password from params
+username = ""
+password = ""
+
+# URL might be either param1 or param2
+if param1.startswith("ftps://"):
+    username, password = get_credentials(param1)
+elif param2.startswith("ftps://"):
+    username, password = get_credentials(param2)
+
+# Connecting to the socket
+url =  "ftps://ftp.3700.network"
+parseurl = urlparse(url)
+hostname = parseurl.hostname
+
+# Connect to control socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((hostname, 21))
+
+# AUTH command
+s.sendall(str.encode('AUTH TLS\r\n'))
+print(recv_response(s))
+
+# Exhaust recv so that the socket can be wrapped
+print(recv_response(s))
+
+# Wrap control socket
+ctx = ssl.create_default_context()
+s_control = ctx.wrap_socket(s, server_hostname=hostname)
+print("control socket has been wrapped")
+
+# USER command
+s_control.sendall(str.encode('USER ' + username + '\r\n'))
+print('USER sent')
+print(recv_response(s_control))
+
+# PASS command
+s_control.sendall(str.encode('PASS ' + password + '\r\n'))
+print('PASS sent')
+print(recv_response(s_control))
+
+# PBSZ command
+s_control.sendall(str.encode('PBSZ 0\r\n'))
+print('PBSZ sent')
+print(recv_response(s_control))
+
+# PROT command
+s_control.sendall(str.encode('PROT P\r\n'))
+print('PROT sent')
+print(recv_response(s_control))
+
+# TYPE command
+s_control.sendall(str.encode('TYPE I\r\n'))
+print('TYPE sent')
+print(recv_response(s_control))
+
+# MODE command
+s_control.sendall(str.encode('MODE S\r\n'))
+print('MODE sent')
+print(recv_response(s_control))
+
+# STRU command
+s_control.sendall(str.encode('STRU F\r\n'))
+print('STRU sent')
+print(recv_response(s_control))
+
+# Function that calls QUIT command
+def quit_ftps():
+    # QUIT command
+    s_control.sendall(str.encode('QUIT\r\n'))
+    print('QUIT sent')
+    print(recv_response(s_control))
+
+#######################################
+##### IMPLEMENTATION OF COMMANDS ######
+#######################################
+
+# ls <URL>                 Print out the directory listing from the FTPS server at the given URL
+# mkdir <URL>              Create a new directory on the FTPS server at the given URL
+# rm <URL>                 Delete the file on the FTPS server at the given URL
+# rmdir <URL>              Delete the directory on the FTPS server at the given URL
+# cp <ARG1> <ARG2>         Copy the file given by ARG1 to the file given by
+#                           ARG2. If ARG1 is a local file, then ARG2 must be a URL, and vice-versa.
+# mv <ARG1> <ARG2>         Move the file given by ARG1 to the file given by
+#                           ARG2. If ARG1 is a local file, then ARG2 must be a URL, and vice-versa.
+
+# Does the PASV command and returns the ip and host of the data channel
+def do_PASV():
+    # PASV command
+    s_control.sendall(str.encode('PASV\r\n'))
+    print('PASV sent')
+    data_iphost = recv_response(s_control)
+    print(data_iphost)
+    iphost_split1 = data_iphost.split('(')[1]
+    iphost_split2 = iphost_split1.split(')')[0]
+    iphost = iphost_split2.split(',')
+    data_ip = ""
+    for i in range(len(iphost)):
+        data_ip += str(iphost[i]) + "."
+        if i == 3:
+            break
+    data_ip = data_ip[:-1]
+    data_host = int(iphost[4])*256 + int(iphost[5])
+    return(data_ip, data_host)
+
+# Implements rm command
+def rm(path):
+    data_ip, data_host = do_PASV()
+    # DELE command
+    dele_path = path.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('DELE ' + dele_path + '\r\n'))
+    print('DELE sent')
+    # DELE response
+    print(recv_response(s_control))
+    quit_ftps()
+
+def download(source, dest):
+    data_ip, data_host = do_PASV()
+    # RETR command
+    source_path = source.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('RETR ' + source_path + '\r\n'))
+    print('RETR sent')
+    # Connect to Data socket
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((data_ip, data_host))
+    print("connected to data socket")
+    # RETR response
+    print(recv_response(s_control))
+    # Wrap data socket
+    ctx2 = ssl.create_default_context()
+    s_data = ctx2.wrap_socket(s2, server_hostname=hostname)
+    print("data socket has been wrapped")
+    # Retrieve file from RETR command
+    filepath = str(dest)
+    file_retrieve = open(filepath, 'wb')
+    file_retrieve_data = s_data.recv(8192)
+    file_retrieve.write(file_retrieve_data)
+    file_retrieve.close
+    print("data has been retrieved")
+    s_data.unwrap().close()
+    print('data socket has been closed')
+    print(recv_response(s_control))
+
+def upload(source, dest):
+    data_ip, data_host = do_PASV()
+    # STOR command
+    dest_path = dest.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('STOR ' + dest_path + '\r\n'))
+    print('STOR sent')
+    # Connect to Data socket
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((data_ip, data_host))
+    print("connected to data socket")
+    # STOR response
+    print(recv_response(s_control))
+    # Wrap data socket
+    ctx2 = ssl.create_default_context()
+    s_data = ctx2.wrap_socket(s2, server_hostname=hostname)
+    print("data socket has been wrapped")
+    # Send file from STOR command
+    file_send = open(source, 'rb')
+    file_data = file_send.read(8192)
+    s_data.send(file_data)
+    print("data has been sent")
+    s_data.unwrap().close()
+    print('data socket has been closed')
+    print(recv_response(s_control))
+
+def cp(source, dest):
+    if source.startswith('ftps://'):
+        download(source, dest)
+    else:
+        upload(source, dest)
+    quit_ftps()
+
+def mv(source, dest):
+    if source.startswith('ftps://'):
+        download(source, dest)
+        rm(source)
+    else:
+        upload(source, dest)
+        os.remove(source)
+    quit_ftps()
+    
+
+def ls(path):
+    data_ip, data_host = do_PASV()
+    # LIST command
+    list_path = path.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('LIST ' + list_path + '\r\n'))
+    print('LIST sent')
+    # Connect to Data socket
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s2.connect((data_ip, data_host))
+    print("connected to data socket")
+    # LIST response
+    print(recv_response(s_control))
+    # Wrap data socket
+    ctx2 = ssl.create_default_context()
+    s_data = ctx2.wrap_socket(s2, server_hostname=hostname)
+    print("data socket has been wrapped")
+    # Do LIST
+    print(s_data.recv(8192).decode("utf-8"))
+    s_data.shutdown(1)
+    s_data.close()
+    print('data socket has been closed')
+    print(s_control.recv(8192).decode("utf-8"))
+
+    quit_ftps()
+
+def mkdir(path):
+    # MKD command
+    mkdir_path = path.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('MKD ' + mkdir_path + '\r\n'))
+    print('MKD sent')
+    print(recv_response(s_control))
+    quit_ftps()
+
+def rmdir(path):
+    # RMD command
+    rmdir_path = path.split('ftps://' + username + ':' + password + '@ftp.3700.network/')[1]
+    s_control.sendall(str.encode('RMD ' + rmdir_path + '\r\n'))
+    print('RMD sent')
+    print(recv_response(s_control))
+    quit_ftps()
+
+
+def commander(operation, param1, param2):
+    if operation == "ls":
+        ls(param1)
+    elif operation == "rm":
+        rm(param1)
+    elif operation == "cp":
+        cp(param1, param2)
+    elif operation == "mv":
+        mv(param1, param2)
+    elif operation == "mkdir":
+        mkdir(param1)
+    elif operation == "rmdir":
+        rmdir(param1)
+
+commander(operation, param1, param2)
